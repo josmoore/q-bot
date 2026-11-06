@@ -7,13 +7,12 @@ from scipy import sparse
 
 def solve(
     alpha, exposures, covariance, specific_variance, benchmark, beta,
-    *, long_only, beta_target, risk_cap,
+    *, long_only, risk_cap,
 ):
     """Maximize alpha under an exact second-order cone tracking-error cap.
 
     Decision variables are active weights and their factor exposures. Keeping
     factor exposures explicit preserves sparsity in the stock risk block.
-    A None beta target leaves beta unconstrained for the HMM feasibility solve.
     """
     stocks, factors = exposures.shape
     size = stocks + factors
@@ -21,14 +20,10 @@ def solve(
     if eig.min() < -1e-10:
         raise ValueError("Barra factor covariance is not positive semidefinite")
     root = vectors * np.sqrt(np.maximum(eig, 0))
-    equalities = [np.ones(stocks)]
-    rhs = [0.0]
-    if beta_target is not None:
-        equalities.append(beta)
-        rhs.append(beta_target)
+    equalities = np.vstack([np.ones(stocks), beta])
     a = [
         sparse.bmat([
-            [sparse.csc_matrix(equalities), sparse.csc_matrix((len(rhs), factors))],
+            [sparse.csc_matrix(equalities), sparse.csc_matrix((2, factors))],
             [-sparse.csc_matrix(exposures.T), sparse.eye(factors)],
         ]),
         sparse.csc_matrix((1, size)),
@@ -37,8 +32,8 @@ def solve(
             [-sparse.diags(np.sqrt(specific_variance)), sparse.csc_matrix((stocks, factors))],
         ]),
     ]
-    b = [np.r_[rhs, np.zeros(factors)], np.r_[risk_cap, np.zeros(size)]]
-    cones = [clarabel.ZeroConeT(len(rhs) + factors), clarabel.SecondOrderConeT(1 + size)]
+    b = [np.zeros(2 + factors), np.r_[risk_cap, np.zeros(size)]]
+    cones = [clarabel.ZeroConeT(2 + factors), clarabel.SecondOrderConeT(1 + size)]
     if long_only:
         a.append(sparse.hstack([-sparse.eye(stocks), sparse.csc_matrix((stocks, factors))]))
         b.append(benchmark)

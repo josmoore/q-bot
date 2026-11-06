@@ -9,19 +9,18 @@ reviewed and pushed upstream as a focused folder.
 - Daily, dated Russell 3000 universe and benchmark data from `sf-quant`.
 - Three stock-level forecasts: DMD, Sharpe Transformer, and inflation beta.
 - Market-beta residual forward returns as the combination-regression target.
-- Exponentially weighted ridge coefficients; select half-life and ridge penalty
-  on chronological validation periods by resulting portfolio performance.
+- Compare fixed exponentially weighted ridge (126 trading sessions, penalty 0.2)
+  with an equal-weight mean of the same three standardized forecasts.
 - One combined alpha followed by one constrained optimization per date.
 - Two active portfolios: 2.5% predicted tracking-error cap and zero active beta;
   the second also requires long-only total weights.
-- Charts for both total portfolios versus the Russell 3000, both active return
-  paths, and the evolving signal coefficients.
+- Charts for cumulative total and benchmark-relative log returns, plus the
+  fitted ridge coefficients.
 - Initial model training before 2010, followed by point-in-time retraining.
 - The ridge target is the next trading day's market-beta residual return.
 - Use sf-quant's dated Barra risk inputs for portfolio optimization.
 - Daily rebalancing. Trading costs are set to zero in this first pass, as
   requested; results must not be described as cost-adjusted.
-- HMM and T-bills are out of scope for this first pass.
 
 ## Source code to adapt
 
@@ -51,22 +50,13 @@ the signal date. The optimizer and risk loaders use the current source checkout
 at `~/libraries/sf-quant`, revision `6317431`, through `PYTHONPATH`; the shared
 installed environment is not modified.
 
-Validation uses 2007–2009 active Sharpe to select among six ridge settings.
-Both test portfolios use the winning setting. The signal date precedes
-execution by one trading session and the holding return ends one session later.
-The 2010–2024 comparison uses the same stock alphas with zero active beta or
-the HMM overlay.
-
-`hmm.sbatch` produces daily scores with q-bot's filtered two-state HMM.
-It aggregates the regime features across dated Russell constituents, fits
-annually on expanding history from 2000, and calibrates state probabilities
-to the Russell holding-period return using labels known at the annual fit.
-Each expected return is standardized against earlier forecasts, starting with
-at least 252 observations. The optimizer divides the z-score by four,
-applies a ±0.15 ceiling, and reduces the target further when the tilt would
-require more than 1.25% standalone Barra tracking error. Total predicted
-tracking error remains capped at 2.5%. The output records the proposed,
-effective, and achieved beta so the amount of scaling can be audited.
+The signal date precedes execution by one trading session and the holding
+return ends one session later. The 2010–2024 comparison tests both
+combinations under each portfolio constraint set. Both use the same trailing
+standardization and treat missing standardized scores as zero. The optional
+`--single-signal` argument runs one raw forecast as an active portfolio.
+The active chart sums the difference of portfolio and benchmark log returns.
+Summary statistics use simple daily returns.
 
 The Slurm entry points are `prepare_assets.sbatch`, `transformer_features.sbatch`,
 `dmd.sbatch`, `transformer.sbatch`, and `backtest.sbatch`. The last requires

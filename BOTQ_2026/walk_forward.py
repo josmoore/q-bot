@@ -1,4 +1,4 @@
-"""Run chronological portfolio validation and testing on dated signal forecasts.
+"""Backtest fixed ridge and equal-weight combinations of dated forecasts.
 
 Forecasts must have one row per signal_date/barrid. The execution date is
 the next market session, and the holding period ends one session later.
@@ -7,7 +7,6 @@ Returns for exits must be supplied in the asset history, including delistings.
 from __future__ import annotations
 
 import argparse
-import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -18,7 +17,6 @@ import polars as pl
 from BOTQ_2026.backtest import active_sharpe, plot_results
 from BOTQ_2026.combination import SIGNALS, daily_ridge_inputs, fit_daily_ridge
 from BOTQ_2026.portfolio import optimize_day
-from BOTQ_2026.validation import select_ridge_parameters
 
 
 def build_panel(assets: pl.DataFrame, forecasts: pl.DataFrame, exits: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -63,161 +61,85 @@ def build_panel(assets: pl.DataFrame, forecasts: pl.DataFrame, exits: pl.DataFra
     return panel.sort(["date", "barrid"])
 
 
+RIDGE_HALF_LIFE = 126  # Six months in trading sessions.
+RIDGE_PENALTY = 0.2
+
+
 def run(
     panel: pl.DataFrame,
     output: Path,
     *,
-    end_date: date | None,
-    validation_cache: dict | None = None,
-    hmm_scores: pl.DataFrame | None = None,
-    baseline_dir: Path | None = None,
+    end_date: date,
     workers: int = 1,
     sparse_solver: bool = False,
     single_signal: str | None = None,
 ) -> None:
-    """Fit using past labels, tune on 2007–09, and report through end_date."""
+    """Fit with matured labels and compare both combinations on identical dates."""
     if single_signal is None:
-        history = panel.filter(pl.col("signal_date") >= date(2005, 1, 1)).select(
+        ridge_inputs = daily_ridge_inputs(panel.select(
             "signal_date", "label_available_date", "forward_residual_return", *SIGNALS
-        )
-        ridge_inputs = daily_ridge_inputs(history)
-    validation = []
-    test = []
-    for day in panel.partition_by("date", maintain_order=True):
+        ))
+    test = panel.filter(
+        (pl.col("date") >= date(2010, 1, 1)) & (pl.col("label_available_date") <= end_date)
+    ).partition_by("date", maintain_order=True)
+    if not test:
+        raise ValueError("No backtest sessions in the requested date range")
+
+    def evaluate_day(day):
         execution = day["date"][0]
-        end = day["label_available_date"][0]
-        if execution >= date(2007, 1, 1) and end < date(2010, 1, 1):
-            validation.append(day)
-        elif end_date is not None and execution >= date(2010, 1, 1) and end <= end_date:
-            test.append(day)
-    if not validation or (end_date is not None and not test):
-        raise ValueError("Expected both validation and test sessions")
-    beta_targets = {}
-    if hmm_scores is not None:
-        if end_date is None:
-            raise ValueError("HMM beta targets are for the out-of-sample test")
-        dates = pl.DataFrame({"signal_date": [day["signal_date"][0] for day in test]})
-        targets = dates.join(
-            hmm_scores.select("signal_date", "hmm_z_score"),
-            on="signal_date", how="left", validate="1:1",
-        )
-        invalid = targets.filter(~pl.col("hmm_z_score").is_finite().fill_null(False))
-        if invalid.height:
-            raise ValueError(f"Missing or non-finite HMM z-score on {invalid['signal_date'][0]}")
-        beta_targets = dict(targets.with_columns(
-            (pl.col("hmm_z_score") / 4).clip(-0.75, 0.75)
-        ).iter_rows())
-    output.mkdir(parents=True, exist_ok=True)
-    returns, coefficients, selected = [], [], {}
-    variants = ("active",) if end_date is None else ("active", "long_only")
-    if single_signal is not None:
-        variants = (f"{single_signal}_active",)
-    if beta_targets:
-        variants += ("active_hmm_beta", "long_only_hmm_beta")
-    if baseline_dir is not None:
-        if not beta_targets or validation_cache is None:
-            raise ValueError("Baseline reuse requires HMM scores and a validation cache")
-        if json.loads((baseline_dir / "validation.json").read_text()) != validation_cache:
-            raise ValueError("Baseline and HMM runs must use the same validation selection")
-        baseline_returns = pl.read_parquet(baseline_dir / "returns.parquet")
-        baseline_coefficients = pl.read_parquet(baseline_dir / "coefficients.parquet")
-        for frame, expected_dates in (
-            (baseline_returns, [day["label_available_date"][0] for day in test]),
-            (baseline_coefficients, [day["date"][0] for day in test]),
-        ):
-            if set(frame["portfolio"].unique()) != {"active", "long_only"} or any(
-                group["date"].sort().to_list() != expected_dates
-                for group in frame.partition_by("portfolio")
-            ):
-                raise ValueError("Saved baseline does not cover the requested test sessions")
-        variants = ("active_hmm_beta", "long_only_hmm_beta")
-    selection = None if validation_cache is None else validation_cache["active"]
-    for variant in variants:
-        def evaluate(days, half_life, penalty, report=False):
-            phase = "test" if report else "validation"
-            print(f"{variant} {phase}: half-life={half_life}, penalty={penalty}, {len(days)} sessions", flush=True)
-            def evaluate_day(day):
-                execution = day["date"][0]
-                if single_signal is not None:
-                    # Use the published sign and preserve the universe when a score is missing.
-                    scores = day[single_signal].to_numpy()
-                    alpha = np.where(np.isfinite(scores), scores, 0.0)
-                else:
-                    fit = fit_daily_ridge(
-                        ridge_inputs, as_of=execution, half_life_days=half_life,
-                        penalty=penalty,
-                    )
-                    scores = day.select(SIGNALS).to_numpy().astype(float)
-                    standardized = (scores - fit.means) / fit.scales
-                    alpha = np.where(np.isfinite(standardized), standardized, 0) @ fit.coefficients
-                target_beta = beta_targets[day["signal_date"][0]] if variant.endswith("_hmm_beta") else 0.0
+        if single_signal is None:
+            fit = fit_daily_ridge(
+                ridge_inputs, as_of=execution, half_life_days=RIDGE_HALF_LIFE,
+                penalty=RIDGE_PENALTY,
+            )
+            scores = (day.select(SIGNALS).to_numpy() - fit.means) / fit.scales
+            # Use the same inputs for both combinations. A missing forecast
+            # contributes zero in standardized units.
+            scores = np.where(np.isfinite(scores), scores, 0.0)
+            alphas = {"ridge": scores @ fit.coefficients, "equal_weight": scores.mean(axis=1)}
+            coefficients = {"date": execution, "portfolio": "ridge",
+                            **dict(zip(SIGNALS, fit.coefficients))}
+        else:
+            scores = day[single_signal].to_numpy()
+            alphas = {single_signal: np.where(np.isfinite(scores), scores, 0.0)}
+            coefficients = None
+
+        rows = []
+        for method, alpha in alphas.items():
+            alpha_panel = day.with_columns(pl.Series("combined_alpha", alpha))
+            for long_only in ((False, True) if single_signal is None else (False,)):
+                portfolio = f"{method}_{'long_only' if long_only else 'active'}"
                 try:
                     weights = optimize_day(
-                        execution, day.with_columns(pl.Series("combined_alpha", alpha)),
-                        long_only=variant.startswith("long_only"),
-                        target_active_beta=target_beta,
-                        sparse_solver=sparse_solver,
+                        execution, alpha_panel, long_only=long_only, sparse_solver=sparse_solver,
                     ).join(day.select("barrid", "holding_return"), on="barrid", validate="1:1")
                 except Exception as exc:
-                    raise RuntimeError(f"{variant} {phase} failed on {execution}") from exc
+                    raise RuntimeError(f"{portfolio} failed on {execution}") from exc
                 realized = weights["holding_return"].to_numpy()
-                active = float(weights["active_weight"].to_numpy() @ realized)
-                row = coefficients_row = None
-                if report:
-                    end = day["label_available_date"][0]
-                    row = dict(date=end, portfolio=variant, active_return=active,
-                                        portfolio_return=float(weights["total_weight"].to_numpy() @ realized),
-                                        benchmark_return=day["benchmark_return"][0],
-                                        carried_names=day["carried_names"][0],
-                                        target_active_beta=target_beta,
-                                        effective_active_beta_target=weights["effective_active_beta_target"][0],
-                                        predicted_tracking_error=weights["predicted_tracking_error"][0],
-                                        active_beta=float(weights["active_weight"].to_numpy() @
-                                                          weights["predicted_beta"].to_numpy()))
-                    if single_signal is None:
-                        coefficients_row = dict(date=execution, portfolio=variant,
-                                            **dict(zip(SIGNALS, fit.coefficients)))
-                return execution, active, row, coefficients_row
+                rows.append(dict(
+                    date=day["label_available_date"][0], portfolio=portfolio,
+                    active_return=float(weights["active_weight"].to_numpy() @ realized),
+                    portfolio_return=float(weights["total_weight"].to_numpy() @ realized),
+                    benchmark_return=day["benchmark_return"][0],
+                    carried_names=day["carried_names"][0],
+                    predicted_tracking_error=weights["predicted_tracking_error"][0],
+                    active_beta=float(weights["active_weight"].to_numpy() @ weights["predicted_beta"].to_numpy()),
+                ))
+        return execution, rows, coefficients
 
-            # Ridge fits only read matured labels and costs are zero, so
-            # each date can be solved independently. Collect in date order.
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for index, (execution, active, row, coefficients_row) in enumerate(
-                    pool.map(evaluate_day, days), 1,
-                ):
-                    if report:
-                        returns.append(row)
-                        if coefficients_row is not None:
-                            coefficients.append(coefficients_row)
-                    if index % 250 == 0 or index == len(days):
-                        print(f"{variant} {phase}: {index}/{len(days)} through {execution}", flush=True)
-                    yield active
+    returns, coefficients = [], []
+    # Solve all variants for a date together so they share the same Barra load.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for index, (execution, rows, coefficient_row) in enumerate(pool.map(evaluate_day, test), 1):
+            returns.extend(rows)
+            if coefficient_row is not None:
+                coefficients.append(coefficient_row)
+            if index % 250 == 0 or index == len(test):
+                print(f"Backtest: {index}/{len(test)} sessions through {execution}", flush=True)
 
-        if single_signal is not None:
-            for _ in evaluate(test, None, None, report=True):
-                pass
-            continue
-        if selection is None:
-            selection = select_ridge_parameters(
-                variant, lambda half, penalty, _: evaluate(validation, half, penalty)
-            )
-        selected["active"] = selection
-        if end_date is None:
-            continue
-        best = selection["best"]
-        for _ in evaluate(test, best["half_life"], best["penalty"], report=True):
-            pass
-    if single_signal is None:
-        (output / "validation.json").write_text(json.dumps(selected, indent=2))
-    if end_date is None:
-        return
+    output.mkdir(parents=True, exist_ok=True)
     performance = pl.DataFrame(returns)
     coefficient_history = pl.DataFrame(coefficients)
-    if baseline_dir is not None:
-        performance = pl.concat([baseline_returns, performance], how="diagonal_relaxed").with_columns(
-            pl.col("target_active_beta", "effective_active_beta_target").fill_null(0)
-        )
-        coefficient_history = pl.concat([baseline_coefficients, coefficient_history])
     performance.write_parquet(output / "returns.parquet")
     if single_signal is None:
         coefficient_history.write_parquet(output / "coefficients.parquet")
@@ -247,37 +169,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sparse-solver", action="store_true")
-    signal_mode = parser.add_mutually_exclusive_group()
-    signal_mode.add_argument("--inflation-only", action="store_const", const="inflation_beta", dest="single_signal")
-    signal_mode.add_argument("--single-signal", choices=SIGNALS, help="Use one raw forecast as the sole alpha")
+    parser.add_argument("--single-signal", choices=SIGNALS, help="Use one raw forecast as the sole alpha")
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--forecasts", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--exits", type=Path)
-    parser.add_argument("--validation-cache", type=Path)
-    parser.add_argument("--hmm-scores", type=Path, help="Parquet with one as-of hmm_z_score per signal_date")
-    parser.add_argument("--baseline-dir", type=Path, help="Reuse completed zero-beta results in an HMM comparison")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--end-date", type=date.fromisoformat)
-    mode.add_argument("--validation-only", action="store_true")
+    parser.add_argument("--end-date", type=date.fromisoformat, required=True)
     parser.add_argument("--root", type=Path, default=Path.home())
     args = parser.parse_args()
-    if args.single_signal and (args.validation_only or args.validation_cache or args.hmm_scores or args.baseline_dir):
-        parser.error("Standalone signals require --end-date and runs without ridge or HMM options")
     sfd.env(root=str(args.root), database="production")
     exits = pl.read_parquet(args.exits) if args.exits else None
-    validation_cache = json.loads(args.validation_cache.read_text()) if args.validation_cache else None
     assets = (
         pl.scan_parquet(args.assets)
-        .filter(pl.col("date").is_between(date(2005, 1, 1), args.end_date or date(2009, 12, 31)))
+        .filter(pl.col("date").is_between(date(2005, 1, 1), args.end_date))
         .select("date", "barrid", "in_universe", "market_cap", "return", "predicted_beta")
         .collect()
     )
     run(
         build_panel(assets, pl.read_parquet(args.forecasts), exits),
-        args.out, end_date=args.end_date, validation_cache=validation_cache,
-        hmm_scores=pl.read_parquet(args.hmm_scores) if args.hmm_scores else None,
-        baseline_dir=args.baseline_dir, workers=args.workers,
+        args.out, end_date=args.end_date, workers=args.workers,
         sparse_solver=args.sparse_solver, single_signal=args.single_signal,
     )
 

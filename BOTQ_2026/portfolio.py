@@ -14,14 +14,11 @@ import polars as pl
 
 
 TARGET_TRACKING_ERROR = 0.025
-HMM_BETA_CAP = 0.15
-# The beta target must be achievable with a standalone 1.25% TE sleeve.
-HMM_BETA_RISK_BUDGET = TARGET_TRACKING_ERROR / 2
 
 
 @lru_cache(maxsize=800)
 def _daily_risk(day: date, ids: tuple[str, ...]):
-    """Reuse dated Barra inputs across validation candidates."""
+    """Reuse dated Barra inputs across portfolios."""
     from sf_quant.data import construct_factor_model_components
 
     return construct_factor_model_components(day, list(ids))
@@ -32,7 +29,6 @@ def optimize_day(
     panel: pl.DataFrame,
     *,
     long_only: bool,
-    target_active_beta: float = 0.0,
     sparse_solver: bool = False,
 ) -> pl.DataFrame:
     """Optimize total and active weights for one dated Russell cross-section.
@@ -64,44 +60,10 @@ def optimize_day(
         raise ValueError(f"{day}: non-finite optimization inputs")
     if not np.isclose(benchmark.sum(), 1.0, atol=1e-6):
         raise ValueError(f"{day}: benchmark weights sum to {benchmark.sum():.8f}")
-    if not np.isfinite(target_active_beta):
-        raise ValueError(f"{day}: non-finite active-beta target")
     exposures, factor_covariance, specific_variance = _daily_risk(day, tuple(ids))
-    constraints = [ZeroInvestment()]
+    constraints = [ZeroInvestment(), ZeroBeta()]
     if long_only:
         constraints.append(LongOnly())
-
-    if target_active_beta != 0:
-        direction = np.sign(target_active_beta)
-        if sparse_solver:
-            from BOTQ_2026.sparse_optimizer import solve
-
-            sleeve, sleeve_risk = solve(
-                direction * beta, exposures, factor_covariance, specific_variance,
-                benchmark, beta, long_only=long_only, beta_target=None,
-                risk_cap=HMM_BETA_RISK_BUDGET,
-            )
-        else:
-            sleeve, sleeve_risk = _solve_soc(
-                direction * beta, exposures, factor_covariance, specific_variance,
-                constraints, benchmark, beta, risk_cap=HMM_BETA_RISK_BUDGET,
-            )
-        if (
-            not np.isfinite(sleeve_risk)
-            or sleeve_risk > HMM_BETA_RISK_BUDGET + 1e-5
-            or abs(sleeve.sum()) > 1e-5
-            or (long_only and (benchmark + sleeve).min() < -1e-6)
-        ):
-            raise ValueError(f"{day}: beta sleeve violates its risk or weight constraints")
-        feasible_beta = max(0.0, float(direction * (beta @ sleeve)))
-        target_active_beta = float(direction * min(
-            abs(target_active_beta), HMM_BETA_CAP, 0.999 * feasible_beta,
-        ))
-
-    def beta_constraint(weights, *, betas, **_):
-        return betas @ weights == target_active_beta
-
-    constraints.append(ZeroBeta() if target_active_beta == 0 else beta_constraint)
     # A positive scaling preserves the optimizer and keeps tiny forecasts
     # from setting the numerical scale of the conic objective.
     scale = max(float(np.max(np.abs(alpha))), np.finfo(float).tiny)
@@ -113,7 +75,7 @@ def optimize_day(
 
             active, predicted_te = solve(
                 alpha / scale, exposures, factor_covariance, specific_variance,
-                benchmark, beta, long_only=long_only, beta_target=target_active_beta,
+                benchmark, beta, long_only=long_only,
                 risk_cap=TARGET_TRACKING_ERROR,
             )
         else:
@@ -137,7 +99,7 @@ def optimize_day(
         )
 
     total = active + benchmark
-    if abs(active.sum()) > 1e-5 or abs(beta @ active - target_active_beta) > 1e-5:
+    if abs(active.sum()) > 1e-5 or abs(beta @ active) > 1e-5:
         raise ValueError(f"{day}: investment or active-beta constraint violated")
     if long_only and total.min() < -1e-6:
         raise ValueError(f"{day}: long-only constraint violated")
@@ -152,7 +114,6 @@ def optimize_day(
             "total_weight": total,
             "predicted_beta": beta,
             "combined_alpha": alpha,
-            "effective_active_beta_target": [target_active_beta] * len(ids),
             "predicted_tracking_error": [predicted_te] * len(ids),
             "portfolio": ["long_only" if long_only else "active"] * len(ids),
         }

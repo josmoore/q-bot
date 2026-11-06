@@ -36,19 +36,17 @@ for day in (date(2010, 1, 5), date(2015, 6, 15), date(2020, 3, 16), date(2024, 1
     risk = _daily_risk(day, tuple(panel["barrid"]))
     load_seconds = perf_counter() - start
     for long_only in (False, True):
-        for requested in (0.0, -0.15, 0.15):
-            start = perf_counter()
-            reference = optimize_day(day, panel, long_only=long_only, target_active_beta=requested)
-            reference_seconds = perf_counter() - start
-            target = reference["effective_active_beta_target"][0]
-            start = perf_counter()
-            weights, te = solve(alpha, *risk, benchmark, beta, long_only=long_only,
-                                beta_target=target, risk_cap=0.025)
-            sparse_seconds = perf_counter() - start
-            reference_objective = alpha @ reference["active_weight"].to_numpy()
-            np.testing.assert_allclose(alpha @ weights, reference_objective, rtol=1e-4, atol=1e-7)
-            assert abs(weights.sum()) < 1e-5 and abs(beta @ weights - target) < 1e-5
-            assert te <= 0.02501 and (not long_only or (weights + benchmark).min() >= -1e-6)
-            print(day, long_only, requested, f"risk_load={load_seconds:.3f}s",
-                  f"reference={reference_seconds:.3f}s", f"sparse={sparse_seconds:.3f}s")
+        start = perf_counter()
+        reference = optimize_day(day, panel, long_only=long_only)
+        reference_seconds = perf_counter() - start
+        start = perf_counter()
+        weights, te = solve(alpha, *risk, benchmark, beta, long_only=long_only,
+                            risk_cap=0.025)
+        sparse_seconds = perf_counter() - start
+        reference_objective = alpha @ reference["active_weight"].to_numpy()
+        np.testing.assert_allclose(alpha @ weights, reference_objective, rtol=1e-4, atol=1e-7)
+        assert abs(weights.sum()) < 1e-5 and abs(beta @ weights) < 1e-5
+        assert te <= 0.02501 and (not long_only or (weights + benchmark).min() >= -1e-6)
+        print(day, long_only, f"risk_load={load_seconds:.3f}s",
+              f"reference={reference_seconds:.3f}s", f"sparse={sparse_seconds:.3f}s")
 PY
