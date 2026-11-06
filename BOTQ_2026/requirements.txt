@@ -1,0 +1,10 @@
+# Install inside a BOTQ_2026-specific environment; do not modify a shared env.
+polars>=1.32
+numpy>=2.0
+scipy>=1.13
+cvxpy>=1.7
+clarabel>=0.10
+matplotlib>=3.9
+torch>=2.5
+yfinance>=0.2.50
+requests>=2.32
