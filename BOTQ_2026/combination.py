@@ -28,8 +28,8 @@ class RidgeFit:
 
     def predict(self, signal_matrix: np.ndarray) -> np.ndarray:
         x = np.asarray(signal_matrix, dtype=float)
-        if x.ndim != 2 or x.shape[1] != len(SIGNALS):
-            raise ValueError(f"Expected matrix with {len(SIGNALS)} signal columns")
+        if x.ndim != 2 or x.shape[1] != self.coefficients.size:
+            raise ValueError(f"Expected matrix with {self.coefficients.size} signal columns")
         return self.intercept + ((x - self.means) / self.scales) @ self.coefficients
 
 
@@ -102,11 +102,11 @@ def fit_ew_ridge(
     )
 
 
-def daily_ridge_inputs(observations: pl.DataFrame):
+def daily_ridge_inputs(observations: pl.DataFrame, signals=SIGNALS):
     """Compress labeled rows to daily sufficient statistics for repeated fits."""
     target = "forward_residual_return"
-    columns = (*SIGNALS, target)
-    products = [(a, b) for i, a in enumerate(SIGNALS) for b in columns[i:]]
+    columns = (*signals, target)
+    products = [(a, b) for i, a in enumerate(signals) for b in columns[i:]]
     daily = (
         observations.filter(pl.all_horizontal(pl.col(c).is_finite() for c in columns))
         .group_by("signal_date", "label_available_date")
@@ -114,31 +114,31 @@ def daily_ridge_inputs(observations: pl.DataFrame):
              *((pl.col(a) * pl.col(b)).sum().alias(f"{a}/{b}") for a, b in products))
         .sort("signal_date")
     )
-    return daily, products
+    return daily, products, signals
 
 
-def fit_daily_ridge(inputs, *, as_of: date, half_life_days: float, penalty: float) -> RidgeFit:
+def fit_daily_ridge(inputs, *, as_of: date, half_life_days: float, penalty: float, center: float = 0.0) -> RidgeFit:
     """Fit trailing standardized ridge from the same moments as the row-level fit."""
-    daily, products = inputs
+    daily, products, signals = inputs
     history = daily.filter(pl.col("label_available_date") < as_of)
     n = history["n"].to_numpy()
     if n.sum() < 30:
         raise ValueError(f"Only {n.sum()} matured observations before {as_of}")
     weights = np.exp2(-np.arange(len(n) - 1, -1, -1) / half_life_days)
     total = weights @ n
-    means = weights @ history.select(*SIGNALS, "forward_residual_return").to_numpy() / total
+    means = weights @ history.select(*signals, "forward_residual_return").to_numpy() / total
     weighted_products = weights @ history.select(*(f"{a}/{b}" for a, b in products)).to_numpy() / total
-    covariance = np.zeros((len(SIGNALS), len(SIGNALS)))
-    cross = np.zeros(len(SIGNALS))
+    covariance = np.zeros((len(signals), len(signals)))
+    cross = np.zeros(len(signals))
     for (a, b), moment in zip(products, weighted_products):
-        i = SIGNALS.index(a)
-        if b in SIGNALS:
-            j = SIGNALS.index(b)
+        i = signals.index(a)
+        if b in signals:
+            j = signals.index(b)
             covariance[i, j] = covariance[j, i] = moment - means[i] * means[j]
         else:
             cross[i] = moment - means[i] * means[-1]
     scales = np.maximum(np.sqrt(np.maximum(covariance.diagonal(), 0)), 1e-12)
     gram = covariance / scales[:, None] / scales[None, :]
-    coefficients = np.linalg.solve(gram + penalty * np.eye(len(SIGNALS)), cross / scales)
+    coefficients = np.linalg.solve(gram + penalty * np.eye(len(signals)), cross / scales + penalty * center)
     return RidgeFit(as_of, half_life_days, penalty, means[-1], coefficients,
                     means[:-1], scales, int(n.sum()))

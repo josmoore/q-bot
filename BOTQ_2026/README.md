@@ -70,3 +70,22 @@ When the primary return is missing, the runner uses the verified CRSP fallback
 where available. Otherwise it carries the position at the last observed value
 for that session. Both portfolios and the benchmark apply the same return, and
 the results table records the number of carried names each session.
+
+The `--centered-grid` experiment fits two ridge candidates: 63 sessions with
+penalty 1 and 1,260 sessions with penalty 0.0025. The first fit uses a zero
+center. The center for the next fit is the largest signed standardized
+coefficient from the preceding fit, shared across the three signals. After
+252 fits, that center is fixed for each candidate; coefficients continue to
+refit daily. Combine `--centered-grid --candidate-returns FILE --include-equal`
+to blend the two fits and the equal-weight rule with the existing
+portfolio-return likelihood. FILE must include the standalone return history
+of all three methods for both portfolio variants.
+
+`python -m BOTQ_2026.dmd_attribution CACHE OUTPUT` compares same-date DMD
+forecasts with Barra momentum and long-term reversal exposures and sf-quant
+momentum and reversal scores. The daily cross-sectional regression uses a
+common matched sample for every comparison. Its payoff decomposition is the
+forward residual return dotted with the fitted and remaining components of
+DMD, scaled by the original DMD gross on that date. These components sum
+to the original payoff; they describe score attribution without portfolio
+constraints or trading costs.

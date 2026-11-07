@@ -55,7 +55,8 @@ def plot_results(returns: pl.DataFrame, coefficients: pl.DataFrame, output: Path
     fig, axes = plt.subplots(count, 1, figsize=(12, 4 * count), sharex=True, squeeze=False)
     for ax, (name, group) in zip(axes[:, 0], c.groupby("portfolio")):
         for signal in ("dmd", "sharpe_transformer", "inflation_beta"):
-            ax.plot(group["date"], group[signal], label=signal)
+            if signal in group:
+                ax.plot(group["date"], group[signal], label=signal)
         ax.axhline(0, color="black", linewidth=.8)
         ax.set_title(f"Ridge coefficients: {name}"); ax.grid(alpha=.25); ax.legend()
     fig.tight_layout(); fig.savefig(output / "ridge_coefficients.png", dpi=160); plt.close(fig)

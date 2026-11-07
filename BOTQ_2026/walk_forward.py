@@ -17,6 +17,8 @@ import polars as pl
 from BOTQ_2026.backtest import active_sharpe, plot_results
 from BOTQ_2026.combination import SIGNALS, daily_ridge_inputs, fit_daily_ridge
 from BOTQ_2026.portfolio import optimize_day
+from BOTQ_2026.dmd_attribution import dmd_style_scores, join_style_controls
+from BOTQ_2026.model_candidates import candidate_alphas, centered_fits, portfolio_posteriors
 
 
 def build_panel(assets: pl.DataFrame, forecasts: pl.DataFrame, exits: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -73,42 +75,113 @@ def run(
     workers: int = 1,
     sparse_solver: bool = False,
     single_signal: str | None = None,
+    ridge_half_life: float = RIDGE_HALF_LIFE,
+    ridge_penalty: float = RIDGE_PENALTY,
+    ridge_only: bool = False,
+    candidate_grid: bool = False,
+    centered_grid: bool = False,
+    dmd_inflation: bool = False,
+    include_equal: bool = False,
+    candidate_returns: pl.DataFrame | None = None,
 ) -> None:
     """Fit with matured labels and compare both combinations on identical dates."""
+    signals = ("dmd", "inflation_beta") if dmd_inflation else SIGNALS
     if single_signal is None:
         ridge_inputs = daily_ridge_inputs(panel.select(
-            "signal_date", "label_available_date", "forward_residual_return", *SIGNALS
-        ))
-    test = panel.filter(
+            "signal_date", "label_available_date", "forward_residual_return", *signals
+        ), signals=signals)
+    test_panel = panel.filter(
         (pl.col("date") >= date(2010, 1, 1)) & (pl.col("label_available_date") <= end_date)
-    ).partition_by("date", maintain_order=True)
+    )
+    if dmd_inflation and candidate_returns is None and not test_panel.is_empty():
+        test_panel = pl.concat([
+            join_style_controls(year) for year in
+            test_panel.with_columns(pl.col("signal_date").dt.year().alias("_style_year"))
+            .partition_by("_style_year", include_key=False)
+        ]).sort("date", "barrid")
+    test = test_panel.partition_by("date", maintain_order=True)
     if not test:
         raise ValueError("No backtest sessions in the requested date range")
 
+    execution_dates = [day["date"][0] for day in test]
+    fits = centered_fits(ridge_inputs, execution_dates) if centered_grid else None
+    include_equal = include_equal or dmd_inflation
+    if candidate_returns is not None:
+        names = list(fits[execution_dates[0]]) if fits else None
+        if names is not None and include_equal:
+            names.append("equal_weight")
+        model_names, posteriors = portfolio_posteriors(candidate_returns, execution_dates, names)
+
+    def day_candidates(execution, scores):
+        if fits is None:
+            yield from candidate_alphas(ridge_inputs, execution, scores)
+            return
+        for name, (fit, _) in fits[execution].items():
+            z = (scores - fit.means) / fit.scales
+            yield name, np.where(np.isfinite(z), z, 0.0) @ fit.coefficients, fit.coefficients
+        if include_equal:
+            fit = fit_daily_ridge(ridge_inputs, as_of=execution, half_life_days=126, penalty=1.0)
+            z = (scores - fit.means) / fit.scales
+            z = np.where(np.isfinite(z), z, 0.0)
+            weights = np.full(len(signals), 1 / len(signals))
+            yield "equal_weight", z @ weights, weights
+            if dmd_inflation and candidate_returns is None:
+                weights = np.array([0.95, 0.05])
+                yield "dmd95_inflation5", z @ weights, weights
+
     def evaluate_day(day):
         execution = day["date"][0]
-        if single_signal is None:
+        if candidate_returns is not None:
+            candidates = {name: alpha for name, alpha, _ in
+                          day_candidates(execution, day.select(signals).to_numpy())}
+            matrix = np.column_stack([candidates[name] for name in model_names])
+            # Standalone optimizers are scale invariant. Normalize dispersion
+            # before blending so posterior weights control relative influence.
+            dispersion = matrix.std(axis=0)
+            matrix = np.divide(matrix, dispersion, out=np.zeros_like(matrix), where=dispersion > 0)
+            alphas = {"bayesian": {variant: matrix @ weights[execution]
+                                   for variant, weights in posteriors.items()}}
+            coefficients = []
+        elif candidate_grid or centered_grid:
+            candidates = list(day_candidates(execution, day.select(signals).to_numpy()))
+            alphas = {name: alpha for name, alpha, _ in candidates}
+            coefficients = []
+            for name, _, weights in candidates:
+                row = {"date": execution, "portfolio": name, **dict(zip(signals, weights))}
+                if fits is not None:
+                    ridge = fits[execution].get(name)
+                    row["ridge_center"] = ridge[1] if ridge else None
+                coefficients.append(row)
+            if dmd_inflation:
+                residual, raw = dmd_style_scores(day)
+                alphas["dmd_residual"] = residual
+                alphas["dmd_matched_raw"] = raw
+        elif single_signal is None:
             fit = fit_daily_ridge(
-                ridge_inputs, as_of=execution, half_life_days=RIDGE_HALF_LIFE,
-                penalty=RIDGE_PENALTY,
+                ridge_inputs, as_of=execution, half_life_days=ridge_half_life,
+                penalty=ridge_penalty,
             )
-            scores = (day.select(SIGNALS).to_numpy() - fit.means) / fit.scales
+            scores = (day.select(signals).to_numpy() - fit.means) / fit.scales
             # Use the same inputs for both combinations. A missing forecast
             # contributes zero in standardized units.
             scores = np.where(np.isfinite(scores), scores, 0.0)
-            alphas = {"ridge": scores @ fit.coefficients, "equal_weight": scores.mean(axis=1)}
-            coefficients = {"date": execution, "portfolio": "ridge",
-                            **dict(zip(SIGNALS, fit.coefficients))}
+            alphas = {"ridge": scores @ fit.coefficients}
+            if not ridge_only:
+                alphas["equal_weight"] = scores.mean(axis=1)
+            coefficients = [{"date": execution, "portfolio": "ridge",
+                             **dict(zip(SIGNALS, fit.coefficients))}]
         else:
             scores = day[single_signal].to_numpy()
             alphas = {single_signal: np.where(np.isfinite(scores), scores, 0.0)}
-            coefficients = None
+            coefficients = []
 
         rows = []
         for method, alpha in alphas.items():
-            alpha_panel = day.with_columns(pl.Series("combined_alpha", alpha))
             for long_only in ((False, True) if single_signal is None else (False,)):
-                portfolio = f"{method}_{'long_only' if long_only else 'active'}"
+                variant = "long_only" if long_only else "active"
+                portfolio = f"{method}_{variant}"
+                score = alpha[variant] if candidate_returns is not None else alpha
+                alpha_panel = day.with_columns(pl.Series("combined_alpha", score))
                 try:
                     weights = optimize_day(
                         execution, alpha_panel, long_only=long_only, sparse_solver=sparse_solver,
@@ -132,8 +205,7 @@ def run(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for index, (execution, rows, coefficient_row) in enumerate(pool.map(evaluate_day, test), 1):
             returns.extend(rows)
-            if coefficient_row is not None:
-                coefficients.append(coefficient_row)
+            coefficients.extend(coefficient_row)
             if index % 250 == 0 or index == len(test):
                 print(f"Backtest: {index}/{len(test)} sessions through {execution}", flush=True)
 
@@ -141,7 +213,12 @@ def run(
     performance = pl.DataFrame(returns)
     coefficient_history = pl.DataFrame(coefficients)
     performance.write_parquet(output / "returns.parquet")
-    if single_signal is None:
+    if candidate_returns is not None:
+        pl.DataFrame([
+            {"date": day, "portfolio": variant, **dict(zip(model_names, weights))}
+            for variant, series in posteriors.items() for day, weights in series.items()
+        ]).write_parquet(output / "model_weights.parquet")
+    if not coefficient_history.is_empty():
         coefficient_history.write_parquet(output / "coefficients.parquet")
     summary = []
     for group in performance.partition_by("portfolio"):
@@ -176,7 +253,30 @@ def main() -> None:
     parser.add_argument("--exits", type=Path)
     parser.add_argument("--end-date", type=date.fromisoformat, required=True)
     parser.add_argument("--root", type=Path, default=Path.home())
+    parser.add_argument("--ridge-half-life", type=float, default=RIDGE_HALF_LIFE)
+    parser.add_argument("--ridge-penalty", type=float, default=RIDGE_PENALTY)
+    parser.add_argument("--ridge-only", action="store_true")
+    parser.add_argument("--candidate-grid", action="store_true")
+    parser.add_argument("--candidate-returns", type=Path, help="Fit portfolio-based Bayesian model weights")
+    parser.add_argument("--centered-grid", action="store_true")
+    parser.add_argument("--include-equal", action="store_true")
+    parser.add_argument("--dmd-inflation", action="store_true",
+                        help="Use DMD and inflation beta in the centered experiment")
     args = parser.parse_args()
+    if args.dmd_inflation and not args.centered_grid:
+        parser.error("--dmd-inflation requires --centered-grid")
+    if args.centered_grid and (args.candidate_grid or args.single_signal or args.ridge_only):
+        parser.error("--centered-grid is incompatible with other standalone run modes")
+    if args.include_equal and not (args.centered_grid and args.candidate_returns):
+        parser.error("--include-equal requires centered grid and merged candidate returns")
+    if args.candidate_returns and (args.candidate_grid or args.single_signal or args.ridge_only):
+        parser.error("--candidate-returns is a separate run mode")
+    if args.candidate_grid and (args.single_signal or args.ridge_only):
+        parser.error("--candidate-grid cannot be combined with --single-signal or --ridge-only")
+    if not np.isfinite(args.ridge_half_life) or args.ridge_half_life <= 0:
+        parser.error("--ridge-half-life must be finite and positive")
+    if not np.isfinite(args.ridge_penalty) or args.ridge_penalty < 0:
+        parser.error("--ridge-penalty must be finite and nonnegative")
     sfd.env(root=str(args.root), database="production")
     exits = pl.read_parquet(args.exits) if args.exits else None
     assets = (
@@ -189,6 +289,11 @@ def main() -> None:
         build_panel(assets, pl.read_parquet(args.forecasts), exits),
         args.out, end_date=args.end_date, workers=args.workers,
         sparse_solver=args.sparse_solver, single_signal=args.single_signal,
+        ridge_half_life=args.ridge_half_life, ridge_penalty=args.ridge_penalty,
+        ridge_only=args.ridge_only, candidate_grid=args.candidate_grid,
+        centered_grid=args.centered_grid, dmd_inflation=args.dmd_inflation,
+        include_equal=args.include_equal,
+        candidate_returns=pl.read_parquet(args.candidate_returns) if args.candidate_returns else None,
     )
 
 
