@@ -1,5 +1,5 @@
 # Dataset access
 
-The public GitHub repository does not contain the analysis panel or dated Barra risk archives. The notebooks retain their executed charts and summary tables. To rerun the backtest, place the authorized dataset files from the local submission package in this directory and run notebook 02 on a BYU Slurm compute node.
+The four notebooks include saved charts and tables. To run their standard cells, download the dataset directory from the Final Submission folder in BYU Box and place its files here. The complete package is available to authorized collaborators. [Final Submission in BYU Box](https://byu.app.box.com/folder/437323708455)
 
-The complete local package is in `outputs/BOTQ_submission` in the Codex workspace. Confirm recipient entitlements before distributing the licensed source-derived data.
+Notebook 1 describes the optional portfolio replay and the additional licensed inputs it requires.
